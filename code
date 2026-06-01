@@ -1,0 +1,237 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ─── إعدادات الشبكة التي ستبثها اللوحة ────────────────
+const char* ssid     = "ESP32_Radar";  // اسم الشبكة المباشرة
+const char* password = "123456789";    // رمز الدخول للشبكة
+
+// ─── إعدادات الشاشة OLED ───────────────────────────────
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ─── بنات التوصيل ──────────────────────────────────────
+#define TRIG_PIN  25
+#define ECHO_PIN  26
+#define SERVO_PIN 15
+
+// ─── إعدادات الرادار ───────────────────────────────────
+#define MAX_DISTANCE 40
+#define RADAR_CX     64
+#define RADAR_CY     63
+#define RADAR_R      58
+
+Servo radarServo;
+int currentAngle = 0;
+int sweepDir     = 1;
+long lastDist    = 0;
+
+// إنشاء السيرفر الرسمي على البورت 80
+WebServer server(80);
+
+// ─── صفحة الويب اللاسلكية (HTML + CSS + JS) ─────────────────
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ESP32 Radar Dashboard</title>
+  <style>
+    body { background-color: #111; color: #0f0; font-family: monospace; text-align: center; margin: 0; padding: 20px; }
+    #radarCanvas { background-color: #000; border: 2px solid #0f0; box-shadow: 0 0 15px #0f0; border-radius: 50% 50% 0 0; }
+    .info { font-size: 22px; margin-top: 15px; }
+  </style>
+</head>
+<body>
+  <h2>رادار ESP32 اللاسلكي</h2>
+  <canvas id="radarCanvas" width="500" height="250"></canvas>
+  <div class="info">الزاوية: <span id="ang">0</span>° | المسافة: <span id="dst">0</span> سم</div>
+  <script>
+    const canvas = document.getElementById('radarCanvas');
+    const ctx = canvas.getContext('2d');
+    const cx = canvas.width / 2, cy = canvas.height, r = canvas.width / 2 - 10;
+    var points = new Array(181).fill(0);
+
+    // تحديث الصفحة تلقائياً كل 50 ملي ثانية
+    setInterval(function() {
+      fetch('/data').then(response => response.text()).then(data => {
+        var d = data.split(",");
+        var angle = parseInt(d[0]);
+        var dist = parseInt(d[1]);
+        document.getElementById('ang').innerText = angle;
+        document.getElementById('dst').innerText = (dist > 40 || dist == 0) ? "--" : dist;
+        points[angle] = dist;
+        draw(angle);
+      });
+    }, 50);
+
+    function draw(curAngle) {
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      ctx.strokeStyle = "rgba(0,255,0,0.2)";
+      for(let i=1; i<=4; i++) { ctx.beginPath(); ctx.arc(cx,cy,(r/4)*i,Math.PI,2*Math.PI); ctx.stroke(); }
+      let rad = curAngle * Math.PI / 180;
+      ctx.strokeStyle = "#0f0"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx - r*Math.cos(rad), cy - r*Math.sin(rad)); ctx.stroke();
+      for(let a=0; a<=180; a++) {
+        if(points[a] > 0 && points[a] <= 40) {
+          let prad = a * Math.PI / 180;
+          let tr = (points[a]/40)*r;
+          ctx.fillStyle = "red"; ctx.beginPath();
+          ctx.arc(cx - tr*Math.cos(prad), cy - tr*Math.sin(prad), 4, 0, 2*Math.PI); ctx.fill();
+        }
+      }
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ─── قياس المسافة ──────────────────────────────────────
+long measureDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000);
+  long distance = duration * 0.034 / 2;
+  if (distance == 0 || distance > 400) distance = 400;
+  return distance;
+}
+
+// ─── رسم شبكة الرادار على OLED ──────────────────────────
+void drawRadarGrid() {
+  display.clearDisplay();
+  for (int r = RADAR_R / 4; r <= RADAR_R; r += RADAR_R / 4) {
+    for (int a = 0; a <= 180; a += 6) {
+      float rad = radians(a);
+      int x = RADAR_CX + r * cos(rad);
+      int y = RADAR_CY - r * sin(rad);
+      if (x >= 0 && x < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT)
+        display.drawPixel(x, y, WHITE);
+    }
+  }
+  display.drawLine(0, RADAR_CY, SCREEN_WIDTH - 1, RADAR_CY, WHITE);
+}
+
+// ─── رسم الشعاع والهدف على OLED ─────────────────────────
+void drawSweep(int angle, long distance) {
+  float rad = radians(angle);
+  int sx = RADAR_CX + RADAR_R * cos(rad);
+  int sy = RADAR_CY - RADAR_R * sin(rad);
+  display.drawLine(RADAR_CX, RADAR_CY, sx, sy, WHITE);
+
+  if (distance <= MAX_DISTANCE) {
+    float ratio = (float)distance / MAX_DISTANCE;
+    if (ratio > 1.0) ratio = 1.0;
+    int tx = RADAR_CX + (RADAR_R * ratio) * cos(rad);
+    int ty = RADAR_CY - (RADAR_R * ratio) * sin(rad);
+    display.fillCircle(tx, ty, 2, WHITE);
+
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("Dist: "); display.print(distance); display.print("cm");
+
+    display.fillRect(28, 54, 72, 10, BLACK);
+    display.setCursor(35, 55);
+    display.print("** DETECTED **");
+  } else {
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("Dist: --");
+
+    display.fillRect(40, 54, 48, 10, BLACK);
+    display.setCursor(45, 55);
+    display.print("CLEAR");
+  }
+
+  display.setCursor(85, 0);
+  display.print("Ang:"); display.print(angle);
+  display.display();
+}
+
+void handleRoot() {
+  server.send_P(200, "text/html", index_html);
+}
+
+void handleData() {
+  String data = String(currentAngle) + "," + String(lastDist);
+  server.send(200, "text/plain", data);
+}
+
+// ─── الإعداد ────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  radarServo.attach(SERVO_PIN, 500, 2400);
+  radarServo.write(90);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED غير موجودة!");
+    while (true);
+  }
+
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setCursor(10, 15);
+  display.println("Starting Radar AP...");
+  display.display();
+
+  // تفعيل بث الشبكة الخاصة من الـ ESP32 مباشرة
+  WiFi.softAP(ssid, password);
+  
+  Serial.println("\nWiFi AP Started!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.softAPIP()); 
+
+  // عرض معلومات الشبكة على الـ OLED لكي تشبك عليها
+  display.clearDisplay();
+  display.setCursor(0, 5);
+  display.println("Connect to WiFi:");
+  display.println(">> ESP32_Radar");
+  display.println("Password: 123456789");
+  display.println("\nGo to URL:");
+  display.print("http://");
+  display.println(WiFi.softAPIP()); // سيظهر غالباً 192.168.4.1
+  display.display();
+  
+  delay(5000); // إبقاء المعلومات 5 ثوانٍ لقراءتها قبل بدء حركة الرادار
+
+  // إعداد مسارات السيرفر
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+}
+
+// ─── الحلقة الرئيسية ───────────────────────────────────
+void loop() {
+  server.handleClient(); // معالجة تحديثات صفحة الويب
+
+  radarServo.write(currentAngle);
+  delay(15); 
+
+  lastDist = measureDistance();
+
+  Serial.print(currentAngle);
+  Serial.print(",");
+  Serial.println(lastDist);
+
+  drawRadarGrid();
+  drawSweep(currentAngle, lastDist);
+
+  currentAngle += sweepDir * 2;
+  if (currentAngle >= 180) {
+    currentAngle = 180;
+    sweepDir = -1;
+  } else if (currentAngle <= 0) {
+    currentAngle = 0;
+    sweepDir = 1;
+  }
+}
