@@ -158,6 +158,15 @@ The ESP32 creates its own wireless network at boot:
                                            (Live Canvas Radar)
 ```
 
+<img width="1171" height="638" alt="image" src="https://github.com/user-attachments/assets/564ab170-e09a-4056-92bc-fa0b5dc41394" />
+
+<img width="1171" height="640" alt="image" src="https://github.com/user-attachments/assets/0c6d3887-ea4a-4c37-9848-c7ce30238ea0" />
+
+
+
+
+
+
 ---
 
 ## 📦 Dependencies / Libraries
